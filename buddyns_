@@ -1,0 +1,157 @@
+#!/usr/bin/perl
+#
+# buddyns_ - Munin plugin for BuddyNS secondary DNS
+#
+# Single graph showing:
+#   traffic_used      — monthly DNS traffic (Kqr, area)
+#   traffic_estimated — projected month-end traffic (Kqr, line)
+#   traffic_quota     — plan quota (Kqr, line)
+#   zones_used        — zones in use (count, blue line)
+#   days_to_reset     — days until monthly reset (count, red line)
+#
+# BuddyNS API v2: https://www.buddyns.com/api/v2/
+# Endpoints used: /zone/  /service/  /user/profile/
+#
+# Installation:
+#   cp buddyns_ /usr/share/munin/plugins/buddyns_
+#   chmod 755   /usr/share/munin/plugins/buddyns_
+#   ln -s /usr/share/munin/plugins/buddyns_ /etc/munin/plugins/buddyns_
+#
+# /etc/munin/plugin-conf.d/buddyns:
+#   [buddyns_*]
+#   env.apikey YOUR_API_TOKEN
+#   # or:
+#   env.username you@example.com
+#   env.password yourpassword
+#
+# Requirements: LWP::UserAgent  JSON  (both in libwww-perl + libjson-perl on Debian/Ubuntu)
+#
+#%# family=contrib
+#%# capabilities=autoconf
+
+use strict;
+use warnings;
+use LWP::UserAgent ();
+use HTTP::Request  ();
+use JSON           qw(decode_json);
+use POSIX          qw(mktime);
+
+my $API_BASE = 'https://www.buddyns.com/api/v2';
+
+my $apikey   = $ENV{apikey}   // '';
+my $username = $ENV{username} // '';
+my $password = $ENV{password} // '';
+
+# ---- autoconf ---------------------------------------------------------
+
+if (@ARGV && $ARGV[0] eq 'autoconf') {
+    if (!$apikey && !$username) {
+        print "no (set env.apikey or env.username/env.password in plugin-conf.d)\n";
+    } else {
+        # Light connectivity check — just hit /service/ and see if auth works
+        my $ok = eval { api_get('service/'); 1 };
+        if ($ok) { print "yes\n" }
+        else     { print "no ($@)\n" }
+    }
+    exit 0;
+}
+
+# ---- config -----------------------------------------------------------
+
+if (@ARGV && $ARGV[0] eq 'config') {
+    print <<'END';
+graph_title BuddyNS Monthly Traffic
+graph_args --base 1000 --lower-limit 0
+graph_vlabel Kqr / count / days
+graph_category dns
+graph_info Monthly DNS query traffic (Kqr), plan quota, month-end estimate, zones in use (blue line), and days until reset (red line). Traffic resets at the start of each calendar month.
+graph_order traffic_used traffic_estimated traffic_quota zones_used days_to_reset
+
+traffic_used.label Traffic used (Kqr)
+traffic_used.draw AREA
+traffic_used.colour 4488cc
+traffic_used.min 0
+traffic_used.info DNS queries served this calendar month, in kilo-queries.
+
+traffic_estimated.label Month-end estimate (Kqr)
+traffic_estimated.draw LINE2
+traffic_estimated.colour ff8800
+traffic_estimated.min 0
+traffic_estimated.info BuddyNS projection of total traffic by end of month at the current daily rate.
+
+traffic_quota.label Quota (Kqr)
+traffic_quota.draw LINE2
+traffic_quota.colour 884400
+traffic_quota.min 0
+traffic_quota.info Monthly traffic quota for the current plan.
+
+zones_used.label Zones used
+zones_used.draw LINE2
+zones_used.colour 0055cc
+zones_used.min 0
+zones_used.info Number of active secondary zones currently delegated to BuddyNS.
+
+days_to_reset.label Days to reset
+days_to_reset.draw LINE2
+days_to_reset.colour cc2200
+days_to_reset.min 0
+days_to_reset.max 31
+days_to_reset.info Days remaining until the monthly traffic counter resets.
+END
+    exit 0;
+}
+
+# ---- fetch ------------------------------------------------------------
+
+my $zones_data   = api_get('zone/');
+my $service_data = api_get('service/');
+my $profile_data = api_get('user/profile/');
+
+my $zones_used        = scalar @$zones_data;
+my $zones_limit       = $service_data->{num_zones}        // 0;
+my $traffic_quota_kqr = $service_data->{traffic_quota}    // 0;
+my $used_raw          = $profile_data->{used_traffic}      // 0;
+my $estimated_raw     = $profile_data->{estimated_traffic} // 0;
+
+# API returns raw query counts; quota is already in Kqr — divide usage by 1000
+my $traffic_used_kqr = $used_raw      / 1000;
+my $traffic_est_kqr  = $estimated_raw / 1000;
+
+# Days remaining in the current calendar month
+my @now = localtime(time);
+my ($cur_year, $cur_mon) = ($now[5] + 1900, $now[4] + 1);
+my ($next_year, $next_mon) = $cur_mon == 12
+    ? ($cur_year + 1, 1)
+    : ($cur_year,     $cur_mon + 1);
+my $reset_epoch   = mktime(0, 0, 0, 1, $next_mon - 1, $next_year - 1900);
+my $days_to_reset = int(($reset_epoch - time) / 86400);
+
+printf "traffic_used.value %.1f\n",      $traffic_used_kqr;
+printf "traffic_estimated.value %.1f\n", $traffic_est_kqr;
+printf "traffic_quota.value %.1f\n",     $traffic_quota_kqr;
+printf "zones_used.value %d\n",          $zones_used;
+printf "days_to_reset.value %d\n",       $days_to_reset;
+
+exit 0;
+
+# ---- helpers ----------------------------------------------------------
+
+sub api_get {
+    my ($path) = @_;
+    my $ua  = LWP::UserAgent->new(timeout => 30, agent => 'munin-buddyns/1.0');
+    my $req = HTTP::Request->new(GET => "$API_BASE/$path");
+    $req->header(Accept => 'application/json');
+    if ($apikey) {
+        $req->header(Authorization => "Token $apikey");
+    } elsif ($username) {
+        $req->authorization_basic($username, $password);
+    } else {
+        die "no authentication configured — set env.apikey or env.username/env.password\n";
+    }
+    my $res = $ua->request($req);
+    if ($res->code == 401 || $res->code == 403) {
+        die "authentication failed (HTTP " . $res->code . ") — check apikey / username / password\n";
+    }
+    die "API error for /$path: " . $res->status_line . "\n" unless $res->is_success;
+    return decode_json($res->decoded_content);
+}
