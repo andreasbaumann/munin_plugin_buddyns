@@ -2,6 +2,10 @@
 
 Munin plugin for [BuddyNS](https://www.buddyns.com/) secondary DNS monitoring.
 
+## Screenshot
+
+![BuddyNS Monthly Traffic graph](buddyns.png)
+
 ## What it monitors
 
 A single graph — **BuddyNS Monthly Traffic** — combining all relevant metrics:
@@ -76,6 +80,22 @@ munin-run buddyns_
 
 `munin-node-configure --suggest` will also list the plugin as available once credentials are in place.
 
+## Developer reference
+
+The plugin uses [BuddyNS API v2](https://www.buddyns.com/api/v2/). Endpoints consumed:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/v2/zone/` | List active secondary zones (zone count) |
+| `GET /api/v2/service/` | Plan details: zone limit, traffic quota |
+| `GET /api/v2/user/profile/` | Usage: queries used and month-end estimate |
+
+Authentication is either a token header (`Authorization: Token <key>`) or HTTP Basic auth.
+
 ## Nagios/Icinga companion
 
 See `check_buddyns` in this repository for a Nagios/Icinga plugin covering the same metrics with WARNING/CRITICAL thresholds.
+
+## Generated with
+
+This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.8).
