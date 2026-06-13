@@ -98,4 +98,4 @@ See `check_buddyns` in this repository for a Nagios/Icinga plugin covering the s
 
 ## Generated with
 
-This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.8).
+This code was generated with [Claude Code](https://claude.ai/code) (Sonnet 4.6).
