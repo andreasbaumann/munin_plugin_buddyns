@@ -17,12 +17,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
-# Single graph showing:
-#   traffic_used      — monthly DNS traffic (Kqr, area)
-#   traffic_estimated — projected month-end traffic (Kqr, line)
-#   traffic_quota     — plan quota (Kqr, line)
-#   zones_used        — zones in use (count, blue line)
-#   days_to_reset     — days until monthly reset (count, red line)
+# Two graphs depending on symlink name:
+#
+#   buddyns_traffic — monthly DNS traffic (Kqr):
+#     traffic_used      — traffic used this month (Kqr, area)
+#     traffic_estimated — projected month-end traffic (Kqr, line)
+#     traffic_quota     — plan quota (Kqr, line)
+#
+#   buddyns_status — operational counters:
+#     zones_used        — zones in use (count, blue line)
+#     days_to_reset     — days until monthly reset (count, red line)
 #
 # BuddyNS API v2: https://www.buddyns.com/api/v2/
 # Endpoints used: /zone/  /service/  /user/profile/
@@ -30,7 +34,8 @@
 # Installation:
 #   cp buddyns_ /usr/share/munin/plugins/buddyns_
 #   chmod 755   /usr/share/munin/plugins/buddyns_
-#   ln -s /usr/share/munin/plugins/buddyns_ /etc/munin/plugins/buddyns_
+#   ln -s /usr/share/munin/plugins/buddyns_ /etc/munin/plugins/buddyns_traffic
+#   ln -s /usr/share/munin/plugins/buddyns_ /etc/munin/plugins/buddyns_status
 #
 # /etc/munin/plugin-conf.d/buddyns:
 #   [buddyns_*]
@@ -57,13 +62,17 @@ my $apikey   = $ENV{apikey}   // '';
 my $username = $ENV{username} // '';
 my $password = $ENV{password} // '';
 
+# Determine graph type from symlink name (buddyns_traffic or buddyns_status)
+(my $self = $0) =~ s{.*/}{};
+my ($graph_type) = ($self =~ /^buddyns_(.+)$/);
+$graph_type //= 'traffic';
+
 # ---- autoconf ---------------------------------------------------------
 
 if (@ARGV && $ARGV[0] eq 'autoconf') {
     if (!$apikey && !$username) {
         print "no (set env.apikey or env.username/env.password in plugin-conf.d)\n";
     } else {
-        # Light connectivity check — just hit /service/ and see if auth works
         my $ok = eval { api_get('service/'); 1 };
         if ($ok) { print "yes\n" }
         else     { print "no ($@)\n" }
@@ -74,13 +83,36 @@ if (@ARGV && $ARGV[0] eq 'autoconf') {
 # ---- config -----------------------------------------------------------
 
 if (@ARGV && $ARGV[0] eq 'config') {
-    print <<'END';
+    if ($graph_type eq 'status') {
+        print <<'END';
+graph_title BuddyNS Status
+graph_args --base 1000 --lower-limit 0
+graph_vlabel count / days
+graph_category dns
+graph_info Number of active secondary zones and days remaining until the monthly traffic counter resets.
+graph_order zones_used days_to_reset
+
+zones_used.label Zones used
+zones_used.draw LINE2
+zones_used.colour 0055cc
+zones_used.min 0
+zones_used.info Number of active secondary zones currently delegated to BuddyNS.
+
+days_to_reset.label Days to reset
+days_to_reset.draw LINE2
+days_to_reset.colour cc2200
+days_to_reset.min 0
+days_to_reset.max 31
+days_to_reset.info Days remaining until the monthly traffic counter resets.
+END
+    } else {
+        print <<'END';
 graph_title BuddyNS Monthly Traffic
 graph_args --base 1000 --lower-limit 0
-graph_vlabel Kqr / count / days
+graph_vlabel Kqr
 graph_category dns
-graph_info Monthly DNS query traffic (Kqr), plan quota, month-end estimate, zones in use (blue line), and days until reset (red line). Traffic resets at the start of each calendar month.
-graph_order traffic_used traffic_estimated traffic_quota zones_used days_to_reset
+graph_info Monthly DNS query traffic (Kqr), plan quota, and month-end estimate. Traffic resets at the start of each calendar month.
+graph_order traffic_used traffic_estimated traffic_quota
 
 traffic_used.label Traffic used (Kqr)
 traffic_used.draw AREA
@@ -99,53 +131,44 @@ traffic_quota.draw LINE2
 traffic_quota.colour 884400
 traffic_quota.min 0
 traffic_quota.info Monthly traffic quota for the current plan.
-
-zones_used.label Zones used
-zones_used.draw LINE2
-zones_used.colour 0055cc
-zones_used.min 0
-zones_used.info Number of active secondary zones currently delegated to BuddyNS.
-
-days_to_reset.label Days to reset
-days_to_reset.draw LINE2
-days_to_reset.colour cc2200
-days_to_reset.min 0
-days_to_reset.max 31
-days_to_reset.info Days remaining until the monthly traffic counter resets.
 END
+    }
     exit 0;
 }
 
 # ---- fetch ------------------------------------------------------------
 
-my $zones_data   = api_get('zone/');
-my $service_data = api_get('service/');
-my $profile_data = api_get('user/profile/');
+if ($graph_type eq 'status') {
+    my $zones_data = api_get('zone/');
 
-my $zones_used        = scalar @$zones_data;
-my $zones_limit       = $service_data->{num_zones}        // 0;
-my $traffic_quota_kqr = $service_data->{traffic_quota}    // 0;
-my $used_raw          = $profile_data->{used_traffic}      // 0;
-my $estimated_raw     = $profile_data->{estimated_traffic} // 0;
+    my $zones_used = scalar @$zones_data;
 
-# API returns raw query counts; quota is already in Kqr — divide usage by 1000
-my $traffic_used_kqr = $used_raw      / 1000;
-my $traffic_est_kqr  = $estimated_raw / 1000;
+    my @now = localtime(time);
+    my ($cur_year, $cur_mon) = ($now[5] + 1900, $now[4] + 1);
+    my ($next_year, $next_mon) = $cur_mon == 12
+        ? ($cur_year + 1, 1)
+        : ($cur_year,     $cur_mon + 1);
+    my $reset_epoch   = mktime(0, 0, 0, 1, $next_mon - 1, $next_year - 1900);
+    my $days_to_reset = int(($reset_epoch - time) / 86400);
 
-# Days remaining in the current calendar month
-my @now = localtime(time);
-my ($cur_year, $cur_mon) = ($now[5] + 1900, $now[4] + 1);
-my ($next_year, $next_mon) = $cur_mon == 12
-    ? ($cur_year + 1, 1)
-    : ($cur_year,     $cur_mon + 1);
-my $reset_epoch   = mktime(0, 0, 0, 1, $next_mon - 1, $next_year - 1900);
-my $days_to_reset = int(($reset_epoch - time) / 86400);
+    printf "zones_used.value %d\n",    $zones_used;
+    printf "days_to_reset.value %d\n", $days_to_reset;
+} else {
+    my $service_data = api_get('service/');
+    my $profile_data = api_get('user/profile/');
 
-printf "traffic_used.value %.1f\n",      $traffic_used_kqr;
-printf "traffic_estimated.value %.1f\n", $traffic_est_kqr;
-printf "traffic_quota.value %.1f\n",     $traffic_quota_kqr;
-printf "zones_used.value %d\n",          $zones_used;
-printf "days_to_reset.value %d\n",       $days_to_reset;
+    my $traffic_quota_kqr = $service_data->{traffic_quota}    // 0;
+    my $used_raw          = $profile_data->{used_traffic}      // 0;
+    my $estimated_raw     = $profile_data->{estimated_traffic} // 0;
+
+    # API returns raw query counts; quota is already in Kqr — divide usage by 1000
+    my $traffic_used_kqr = $used_raw      / 1000;
+    my $traffic_est_kqr  = $estimated_raw / 1000;
+
+    printf "traffic_used.value %.1f\n",      $traffic_used_kqr;
+    printf "traffic_estimated.value %.1f\n", $traffic_est_kqr;
+    printf "traffic_quota.value %.1f\n",     $traffic_quota_kqr;
+}
 
 exit 0;
 
